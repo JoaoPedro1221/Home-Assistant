@@ -1,0 +1,142 @@
+blueprint:
+  name: Paralelo Virtual Estável — Principal e Espelhos
+  description: >
+    Sincroniza uma luz ou switch principal com interruptores espelho.
+    Usa a entidade realmente ligada à carga como fonte de verdade,
+    evitando loops, piscadas e inversões causadas por atualizações atrasadas.
+  domain: automation
+
+  input:
+    principal:
+      name: Luz ou relé principal
+      description: >
+        Entidade que está realmente ligada à lâmpada ou carga.
+      selector:
+        entity:
+          domain:
+            - switch
+            - light
+
+    espelhos:
+      name: Interruptores espelho
+      description: >
+        Canais dos outros interruptores que devem acompanhar e controlar
+        a entidade principal.
+      selector:
+        entity:
+          domain:
+            - switch
+            - light
+          multiple: true
+
+    estabilizacao:
+      name: Tempo de estabilização
+      description: >
+        Aguarda este tempo antes de aceitar a alteração de um espelho.
+        Ajuda a ignorar estados transitórios e atualizações atrasadas.
+      default: 0.5
+      selector:
+        number:
+          min: 0.1
+          max: 2
+          step: 0.1
+          unit_of_measurement: s
+          mode: slider
+
+variables:
+  entidade_principal: !input principal
+  entidades_espelho: !input espelhos
+  tempo_estabilizacao: !input estabilizacao
+
+trigger:
+  - platform: state
+    entity_id: !input principal
+    from: "off"
+    to: "on"
+    id: principal_on
+
+  - platform: state
+    entity_id: !input principal
+    from: "on"
+    to: "off"
+    id: principal_off
+
+  - platform: state
+    entity_id: !input espelhos
+    from: "off"
+    to: "on"
+    id: espelho_on
+
+  - platform: state
+    entity_id: !input espelhos
+    from: "on"
+    to: "off"
+    id: espelho_off
+
+action:
+  - choose:
+
+      # O principal mudou: sincroniza todos os espelhos.
+      - conditions:
+          - condition: template
+            value_template: >
+              {{ trigger.id in ['principal_on', 'principal_off'] }}
+        sequence:
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: >
+                      {{ trigger.to_state.state == 'on' }}
+                sequence:
+                  - service: homeassistant.turn_on
+                    target:
+                      entity_id: !input espelhos
+
+              - conditions:
+                  - condition: template
+                    value_template: >
+                      {{ trigger.to_state.state == 'off' }}
+                sequence:
+                  - service: homeassistant.turn_off
+                    target:
+                      entity_id: !input espelhos
+
+      # Um espelho mudou: aguarda estabilizar e comanda o principal.
+      - conditions:
+          - condition: template
+            value_template: >
+              {{ trigger.id in ['espelho_on', 'espelho_off'] }}
+        sequence:
+          - delay: "{{ tempo_estabilizacao }}"
+
+          # Confirma que o espelho ainda está no estado que gerou o gatilho.
+          - condition: template
+            value_template: >
+              {{ states(trigger.entity_id) == trigger.to_state.state }}
+
+          # Só envia comando se o principal realmente estiver diferente.
+          - condition: template
+            value_template: >
+              {{ states(entidade_principal) != trigger.to_state.state }}
+
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: >
+                      {{ trigger.to_state.state == 'on' }}
+                sequence:
+                  - service: homeassistant.turn_on
+                    target:
+                      entity_id: !input principal
+
+              - conditions:
+                  - condition: template
+                    value_template: >
+                      {{ trigger.to_state.state == 'off' }}
+                sequence:
+                  - service: homeassistant.turn_off
+                    target:
+                      entity_id: !input principal
+
+mode: restart
+max_exceeded: silent
