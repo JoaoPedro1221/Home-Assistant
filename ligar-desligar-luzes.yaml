@@ -1,0 +1,215 @@
+blueprint:
+  name: Controlar vários dispositivos com confirmação e repetição
+  description: >
+    Liga ou desliga, em sequência, luzes, switches, grupos e input_booleans.
+    Aguarda a atualização dos estados e repete somente os alvos que ainda
+    não confirmaram o estado escolhido. Também permite executar ações adicionais,
+    como pressionar um input_button, iniciar um script, ativar uma cena ou
+    disparar outra automação.
+  domain: automation
+
+  input:
+    gatilhos:
+      name: Gatilho(s)
+      description: >
+        Escolha o que iniciará a rotina. Para um botão fictício, use um gatilho
+        de Estado e selecione o input_button desejado, sem preencher "de" ou "para".
+      selector:
+        trigger: {}
+
+    acao_desejada:
+      name: Ação desejada
+      description: >
+        Escolha se todos os alvos selecionados deverão ser ligados ou desligados.
+      default: "on"
+      selector:
+        select:
+          options:
+            - label: Ligar
+              value: "on"
+            - label: Desligar
+              value: "off"
+          mode: list
+
+    alvos_controlar:
+      name: Dispositivos e grupos
+      description: >
+        Selecione as entidades reais ligadas às cargas e/ou grupos do Zigbee2MQTT.
+        A ordem escolhida será respeitada. Evite incluir canais que são apenas
+        espelhos de um paralelo virtual.
+      selector:
+        entity:
+          multiple: true
+          reorder: true
+          filter:
+            - domain:
+                - light
+                - switch
+                - group
+                - input_boolean
+
+    acoes_adicionais:
+      name: Ações adicionais
+      description: >
+        Opcional. Use para pressionar outro input_button, executar um script,
+        ativar uma cena ou disparar outra automação, como uma rotina separada
+        da área externa. As ações serão executadas depois das tentativas dos
+        alvos principais e não terão o estado verificado por esta blueprint.
+      default: []
+      selector:
+        action: {}
+
+    intervalo_comandos:
+      name: Intervalo entre comandos
+      description: >
+        Pequeno intervalo entre cada comando para reduzir congestionamento
+        na rede Zigbee, MQTT ou Wi-Fi.
+      default: 350
+      selector:
+        number:
+          min: 0
+          max: 2000
+          step: 50
+          unit_of_measurement: ms
+          mode: slider
+
+    espera_confirmacao:
+      name: Espera para confirmação
+      description: >
+        Tempo aguardado depois de cada rodada para os estados retornarem ao
+        Home Assistant antes da próxima verificação.
+      default: 2
+      selector:
+        number:
+          min: 1
+          max: 15
+          step: 1
+          unit_of_measurement: s
+          mode: slider
+
+    tentativas_totais:
+      name: Número total de tentativas
+      description: >
+        Inclui a primeira tentativa. Em cada rodada seguinte, somente entidades
+        que ainda não confirmaram o estado escolhido recebem outro comando.
+      default: 3
+      selector:
+        number:
+          min: 1
+          max: 5
+          step: 1
+          mode: slider
+
+    notificar_falhas:
+      name: Criar notificação se algum alvo não responder
+      description: >
+        Ao final, cria uma notificação persistente com os alvos que não
+        confirmaram o estado escolhido e o estado atual de cada um.
+      default: true
+      selector:
+        boolean: {}
+
+triggers: !input gatilhos
+
+conditions: []
+
+actions:
+  - alias: Preparar variáveis
+    variables:
+      alvos: !input alvos_controlar
+      estado_desejado: !input acao_desejada
+      intervalo_ms: !input intervalo_comandos
+      espera_s: !input espera_confirmacao
+      total_tentativas: !input tentativas_totais
+      gerar_notificacao: !input notificar_falhas
+      acao_pt: >-
+        {{ 'ligar' if estado_desejado == 'on' else 'desligar' }}
+      estado_pt: >-
+        {{ 'ligado' if estado_desejado == 'on' else 'desligado' }}
+
+  - alias: Controlar e repetir somente os alvos pendentes
+    repeat:
+      count: "{{ total_tentativas | int }}"
+      sequence:
+        - alias: Identificar alvos que ainda não confirmaram
+          variables:
+            pendentes: >-
+              {% set ns = namespace(itens=[]) %}
+              {% for entidade in alvos %}
+                {% if states(entidade) != estado_desejado %}
+                  {% set ns.itens = ns.itens + [entidade] %}
+                {% endif %}
+              {% endfor %}
+              {{ ns.itens }}
+
+        - if:
+            - condition: template
+              value_template: "{{ pendentes | count > 0 }}"
+          then:
+            - alias: Enviar comandos individualmente
+              repeat:
+                for_each: "{{ pendentes }}"
+                sequence:
+                  - alias: Aplicar ação escolhida ao alvo
+                    choose:
+                      - conditions:
+                          - condition: template
+                            value_template: "{{ estado_desejado == 'on' }}"
+                        sequence:
+                          - alias: Ligar alvo
+                            continue_on_error: true
+                            action: homeassistant.turn_on
+                            target:
+                              entity_id: "{{ repeat.item }}"
+                    default:
+                      - alias: Desligar alvo
+                        continue_on_error: true
+                        action: homeassistant.turn_off
+                        target:
+                          entity_id: "{{ repeat.item }}"
+
+                  - alias: Intervalo para não congestionar a rede
+                    delay:
+                      milliseconds: "{{ intervalo_ms | int }}"
+
+            - alias: Aguardar retorno dos estados
+              delay:
+                seconds: "{{ espera_s | int }}"
+
+  - alias: Executar ações adicionais
+    continue_on_error: true
+    sequence: !input acoes_adicionais
+
+  - alias: Fazer verificação final
+    variables:
+      falharam: >-
+        {% set ns = namespace(itens=[]) %}
+        {% for entidade in alvos %}
+          {% if states(entidade) != estado_desejado %}
+            {% set ns.itens = ns.itens + [entidade] %}
+          {% endif %}
+        {% endfor %}
+        {{ ns.itens }}
+
+  - if:
+      - condition: template
+        value_template: >
+          {{ gerar_notificacao | bool and (falharam | count > 0) }}
+    then:
+      - alias: Informar entidades que não confirmaram
+        action: persistent_notification.create
+        data:
+          title: >-
+            Casa — dispositivos que não confirmaram {{ estado_pt }}
+          message: |-
+            Após {{ total_tentativas }} tentativa(s) de {{ acao_pt }},
+            estes alvos não confirmaram o estado "{{ estado_desejado }}":
+
+            {% for entidade in falharam %}
+            - {{ state_attr(entidade, 'friendly_name') or entidade }}
+              Entidade: {{ entidade }}
+              Estado atual: {{ states(entidade) }}
+            {% endfor %}
+
+mode: restart
+max_exceeded: silent
